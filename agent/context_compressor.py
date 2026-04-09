@@ -14,7 +14,7 @@ Improvements over v1:
 """
 
 import logging
-import os
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm
@@ -47,6 +47,7 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
+_SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 
 class ContextCompressor:
@@ -119,6 +120,7 @@ class ContextCompressor:
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
+        self._summary_failure_cooldown_until: float = 0.0
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -142,7 +144,7 @@ class ContextCompressor:
             "last_prompt_tokens": self.last_prompt_tokens,
             "threshold_tokens": self.threshold_tokens,
             "context_length": self.context_length,
-            "usage_percent": (self.last_prompt_tokens / self.context_length * 100) if self.context_length else 0,
+            "usage_percent": min(100, (self.last_prompt_tokens / self.context_length * 100)) if self.context_length else 0,
             "compression_count": self.compression_count,
         }
 
@@ -197,30 +199,39 @@ class ContextCompressor:
         budget = int(content_tokens * _SUMMARY_RATIO)
         return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
 
+    # Truncation limits for the summarizer input.  These bound how much of
+    # each message the summary model sees — the budget is the *summary*
+    # model's context window, not the main model's.
+    _CONTENT_MAX = 6000       # total chars per message body
+    _CONTENT_HEAD = 4000      # chars kept from the start
+    _CONTENT_TAIL = 1500      # chars kept from the end
+    _TOOL_ARGS_MAX = 1500     # tool call argument chars
+    _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
+
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
-        Includes tool call arguments and result content (up to 3000 chars
-        per message) so the summarizer can preserve specific details like
-        file paths, commands, and outputs.
+        Includes tool call arguments and result content (up to
+        ``_CONTENT_MAX`` chars per message) so the summarizer can preserve
+        specific details like file paths, commands, and outputs.
         """
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
             content = msg.get("content") or ""
 
-            # Tool results: keep more content than before (3000 chars)
+            # Tool results: keep enough content for the summarizer
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
-                if len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                if len(content) > self._CONTENT_MAX:
+                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
             # Assistant messages: include tool call names AND arguments
             if role == "assistant":
-                if len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                if len(content) > self._CONTENT_MAX:
+                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
                     tc_parts = []
@@ -230,8 +241,8 @@ class ContextCompressor:
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
                             # Truncate long arguments but keep enough for context
-                            if len(args) > 500:
-                                args = args[:400] + "..."
+                            if len(args) > self._TOOL_ARGS_MAX:
+                                args = args[:self._TOOL_ARGS_HEAD] + "..."
                             tc_parts.append(f"  {name}({args})")
                         else:
                             fn = getattr(tc, "function", None)
@@ -242,8 +253,8 @@ class ContextCompressor:
                 continue
 
             # User and other roles
-            if len(content) > 3000:
-                content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+            if len(content) > self._CONTENT_MAX:
+                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
@@ -259,6 +270,14 @@ class ContextCompressor:
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            logger.debug(
+                "Skipping context summary during cooldown (%.0fs remaining)",
+                self._summary_failure_cooldown_until - now,
+            )
+            return None
+
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
 
@@ -300,6 +319,9 @@ Update the summary using this exact structure. PRESERVE all existing information
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
 
+## Tools & Patterns
+[Which tools were used, how they were used effectively, and any tool-specific discoveries. Accumulate across compactions.]
+
 Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
 
 Write only the summary body. Do not include any preamble or prefix."""
@@ -338,6 +360,9 @@ Use this exact structure:
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
 
+## Tools & Patterns
+[Which tools were used, how they were used effectively, and any tool-specific discoveries (e.g., preferred flags, working invocations, successful command patterns)]
+
 Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. The goal is to prevent the next assistant from repeating work or losing important details.
 
 Write only the summary body. Do not include any preamble or prefix."""
@@ -346,9 +371,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             call_kwargs = {
                 "task": "compression",
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
                 "max_tokens": summary_budget * 2,
-                "timeout": 45.0,
+                # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
@@ -360,13 +384,23 @@ Write only the summary body. Do not include any preamble or prefix."""
             summary = content.strip()
             # Store for iterative updates on next compaction
             self._previous_summary = summary
+            self._summary_failure_cooldown_until = 0.0
             return self._with_summary_prefix(summary)
         except RuntimeError:
+            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary.")
+                            "summary. Middle turns will be dropped without summary "
+                            "for %d seconds.",
+                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
             return None
         except Exception as e:
-            logging.warning("Failed to generate context summary: %s", e)
+            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+            logging.warning(
+                "Failed to generate context summary: %s. "
+                "Further summary attempts paused for %d seconds.",
+                e,
+                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+            )
             return None
 
     @staticmethod
@@ -649,7 +683,7 @@ Write only the summary body. Do not include any preamble or prefix."""
                 compressed.append({"role": summary_role, "content": summary})
         else:
             if not self.quiet_mode:
-                logger.warning("No summary model available — middle turns dropped without summary")
+                logger.debug("No summary model available — middle turns dropped without summary")
 
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()

@@ -126,9 +126,20 @@ class TestAppMentionHandler:
             "user": "testbot",
         })
 
+        # Mock AsyncWebClient so multi-workspace auth_test is awaitable
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
         with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
              patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
              patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("asyncio.create_task"):
             asyncio.run(adapter.connect())
 
@@ -397,19 +408,22 @@ class TestIncomingDocumentHandling:
         assert "[Content of" not in (msg_event.text or "")
 
     @pytest.mark.asyncio
-    async def test_unsupported_file_type_skipped(self, adapter):
-        """A .zip file should be silently skipped."""
-        event = self._make_event(files=[{
-            "mimetype": "application/zip",
-            "name": "archive.zip",
-            "url_private_download": "https://files.slack.com/archive.zip",
-            "size": 1024,
-        }])
-        await adapter._handle_slack_message(event)
+    async def test_zip_file_cached(self, adapter):
+        """A .zip file should be cached as a supported document."""
+        with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as dl:
+            dl.return_value = b"PK\x03\x04zip"
+            event = self._make_event(files=[{
+                "mimetype": "application/zip",
+                "name": "archive.zip",
+                "url_private_download": "https://files.slack.com/archive.zip",
+                "size": 1024,
+            }])
+            await adapter._handle_slack_message(event)
 
         msg_event = adapter.handle_message.call_args[0][0]
-        assert msg_event.message_type == MessageType.TEXT
-        assert len(msg_event.media_urls) == 0
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types == ["application/zip"]
 
     @pytest.mark.asyncio
     async def test_oversized_document_skipped(self, adapter):
@@ -686,6 +700,147 @@ class TestReactions:
 
 
 # ---------------------------------------------------------------------------
+# TestThreadReplyHandling
+# ---------------------------------------------------------------------------
+
+
+class TestThreadReplyHandling:
+    """Test thread reply processing without explicit bot mentions."""
+
+    @pytest.fixture()
+    def mock_session_store(self):
+        """Create a mock session store with entries dict."""
+        store = MagicMock()
+        store._entries = {}
+        store._ensure_loaded = MagicMock()
+        store.config = MagicMock()
+        store.config.group_sessions_per_user = True
+        return store
+
+    @pytest.fixture()
+    def adapter_with_session_store(self, mock_session_store):
+        """Create an adapter with a mock session store attached."""
+        config = PlatformConfig(enabled=True, token="***")
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._bot_user_id = "U_BOT"
+        a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._running = True
+        a.handle_message = AsyncMock()
+        a.set_session_store(mock_session_store)
+        return a
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_without_mention_no_session_ignored(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Thread replies without mention should be ignored if no active session."""
+        mock_session_store._entries = {}  # No active sessions
+
+        event = {
+            "text": "Just replying in the thread",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",  # Different from ts - this is a reply
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_without_mention_with_session_processed(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Thread replies without mention should be processed if there's an active session."""
+        # Simulate an active session for this thread
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "Follow-up question",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",  # Reply in thread 123.000
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_called_once()
+
+        # Verify the text is passed through unchanged (no mention stripping needed)
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert msg_event.text == "Follow-up question"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_with_mention_strips_bot_id(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Thread replies with @mention should still strip the bot ID."""
+        # Even with a session, mentions should be stripped
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "<@U_BOT> thanks for the help",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_called_once()
+
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "<@U_BOT>" not in msg_event.text
+        assert msg_event.text == "thanks for the help"
+
+    @pytest.mark.asyncio
+    async def test_top_level_message_requires_mention_even_with_session(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Top-level channel messages should require mention even if session exists."""
+        # Session exists but this is a top-level message (no thread_ts)
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "New question without mention",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "456.789",
+            # No thread_ts - this is a top-level message
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_session_store_ignores_thread_replies(
+        self, adapter
+    ):
+        """If no session store is attached, thread replies without mention should be ignored."""
+        # adapter fixture has no session store attached
+        event = {
+            "text": "Thread reply without mention",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # TestUserNameResolution
 # ---------------------------------------------------------------------------
 
@@ -946,3 +1101,100 @@ class TestFallbackPreservesThreadContext:
 
         call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "important screenshot" in call_kwargs["text"]
+
+
+# ---------------------------------------------------------------------------
+# TestProgressMessageThread
+# ---------------------------------------------------------------------------
+
+class TestProgressMessageThread:
+    """Verify that progress messages go to the correct thread.
+
+    Issue #2954: For Slack DM top-level messages, source.thread_id is None
+    but the final reply is threaded under the user's message via reply_to.
+    Progress messages must use the same thread anchor (the original message's
+    ts) so they appear in the thread instead of the DM root.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dm_toplevel_progress_uses_message_ts_as_thread(self, adapter):
+        """Progress messages for a top-level DM should go into the reply thread."""
+        # Simulate a top-level DM: no thread_ts in the event
+        event = {
+            "channel": "D_DM",
+            "channel_type": "im",
+            "user": "U_USER",
+            "text": "Hello bot",
+            "ts": "1234567890.000001",
+            # No thread_ts — this is a top-level DM
+        }
+
+        captured_events = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured_events.append(e))
+
+        # Patch _resolve_user_name to avoid async Slack API call
+        with patch.object(adapter, "_resolve_user_name", new=AsyncMock(return_value="testuser")):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured_events) == 1
+        msg_event = captured_events[0]
+        source = msg_event.source
+
+        # For a top-level DM: source.thread_id should remain None
+        # (session keying must not be affected)
+        assert source.thread_id is None, (
+            "source.thread_id must stay None for top-level DMs "
+            "so they share one continuous session"
+        )
+
+        # The message_id should be the event's ts — this is what the gateway
+        # passes as event_message_id so progress messages can thread correctly
+        assert msg_event.message_id == "1234567890.000001", (
+            "message_id must equal the event ts so _run_agent can use it as "
+            "the fallback thread anchor for progress messages"
+        )
+
+        # Verify that the Slack send() method correctly threads a message
+        # when metadata contains thread_id equal to the original ts
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
+        result = await adapter.send(
+            chat_id="D_DM",
+            content="⚙️ working...",
+            metadata={"thread_id": msg_event.message_id},
+        )
+        assert result.success
+        call_kwargs = adapter._app.client.chat_postMessage.call_args[1]
+        assert call_kwargs.get("thread_ts") == "1234567890.000001", (
+            "send() must pass thread_ts when metadata has thread_id, "
+            "ensuring progress messages land in the thread"
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_mention_progress_uses_thread_ts(self, adapter):
+        """Progress messages for a channel @mention should go into the reply thread."""
+        # Simulate an @mention in a channel: the event ts becomes the thread anchor
+        event = {
+            "channel": "C_CHAN",
+            "channel_type": "channel",
+            "user": "U_USER",
+            "text": f"<@U_BOT> help me",
+            "ts": "2000000000.000001",
+            # No thread_ts — top-level channel message
+        }
+
+        captured_events = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured_events.append(e))
+
+        with patch.object(adapter, "_resolve_user_name", new=AsyncMock(return_value="testuser")):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured_events) == 1
+        msg_event = captured_events[0]
+        source = msg_event.source
+
+        # For channel @mention: thread_id should equal the event ts (fallback)
+        assert source.thread_id == "2000000000.000001", (
+            "source.thread_id must equal the event ts for channel messages "
+            "so each @mention starts its own thread"
+        )
+        assert msg_event.message_id == "2000000000.000001"

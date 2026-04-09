@@ -15,8 +15,8 @@ crashes due to a bad timezone string.
 
 import logging
 import os
-from datetime import datetime, timezone as _tz
-from pathlib import Path
+from datetime import datetime
+from hermes_constants import get_hermes_home
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ def _resolve_timezone_name() -> str:
     # 2. config.yaml ``timezone`` key
     try:
         import yaml
-        hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+        hermes_home = get_hermes_home()
         config_path = hermes_home / "config.yaml"
         if config_path.exists():
             with open(config_path) as f:
@@ -91,7 +91,6 @@ def get_timezone() -> Optional[ZoneInfo]:
 
 def get_timezone_name() -> str:
     """Return the IANA name of the configured timezone, or empty string."""
-    global _cached_tz_name, _cache_resolved
     if not _cache_resolved:
         get_timezone()  # populates cache
     return _cached_tz_name or ""

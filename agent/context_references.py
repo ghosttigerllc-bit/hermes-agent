@@ -17,7 +17,7 @@ REFERENCE_PATTERN = re.compile(
     r"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url):(?P<value>\S+))"
 )
 TRAILING_PUNCTUATION = ",.;!?"
-_SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube")
+_SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh")
 _SENSITIVE_HERMES_DIRS = (Path("skills") / ".hub",)
 _SENSITIVE_HOME_FILES = (
     Path(".ssh") / "authorized_keys",
@@ -286,12 +286,16 @@ def _expand_git_reference(
     args: list[str],
     label: str,
 ) -> tuple[str | None, str | None]:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return f"{ref.raw}: git command timed out (30s)", None
     if result.returncode != 0:
         stderr = (result.stderr or "").strip() or "git command failed"
         return f"{ref.raw}: {stderr}", None
@@ -339,10 +343,9 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
 
 
 def _ensure_reference_path_allowed(path: Path) -> None:
+    from hermes_constants import get_hermes_home
     home = Path(os.path.expanduser("~")).resolve()
-    hermes_home = Path(
-        os.getenv("HERMES_HOME", str(home / ".hermes"))
-    ).expanduser().resolve()
+    hermes_home = get_hermes_home().resolve()
 
     blocked_exact = {home / rel for rel in _SENSITIVE_HOME_FILES}
     blocked_exact.add(hermes_home / ".env")
@@ -449,8 +452,11 @@ def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
             cwd=cwd,
             capture_output=True,
             text=True,
+            timeout=10,
         )
     except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
         return None
     if result.returncode != 0:
         return None

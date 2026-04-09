@@ -18,11 +18,10 @@ Flow:
 import asyncio
 import concurrent.futures
 import json
-import os
 import logging
 from typing import Dict, Any, List, Optional, Union
 
-from agent.auxiliary_client import async_call_llm
+from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
@@ -162,7 +161,15 @@ async def _summarize_session(
                 temperature=0.1,
                 max_tokens=MAX_SUMMARY_TOKENS,
             )
-            return response.choices[0].message.content.strip()
+            content = extract_content_or_reasoning(response)
+            if content:
+                return content
+            # Reasoning-only / empty — let the retry loop handle it
+            logging.warning("Session search LLM returned empty content (attempt %d/%d)", attempt + 1, max_retries)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            return content
         except RuntimeError:
             logging.warning("No auxiliary model available for session summarization")
             return None
@@ -179,10 +186,16 @@ async def _summarize_session(
                 return None
 
 
+# Sources that are excluded from session browsing/searching by default.
+# Third-party integrations (Paperclip agents, etc.) tag their sessions with
+# HERMES_SESSION_SOURCE=tool so they don't clutter the user's session history.
+_HIDDEN_SESSION_SOURCES = ("tool",)
+
+
 def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(limit=limit + 5)  # fetch extra to skip current
+        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
 
         # Resolve current session lineage to exclude it
         current_root = None
@@ -228,7 +241,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
         }, ensure_ascii=False)
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
-        return json.dumps({"success": False, "error": f"Failed to list recent sessions: {e}"}, ensure_ascii=False)
+        return tool_error(f"Failed to list recent sessions: {e}", success=False)
 
 
 def session_search(
@@ -245,7 +258,7 @@ def session_search(
     The current session is excluded from results since the agent already has that context.
     """
     if db is None:
-        return json.dumps({"success": False, "error": "Session database not available."}, ensure_ascii=False)
+        return tool_error("Session database not available.", success=False)
 
     limit = min(limit, 5)  # Cap at 5 sessions to avoid excessive LLM calls
 
@@ -266,6 +279,7 @@ def session_search(
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # Get more matches to find unique sessions
             offset=0,
         )
@@ -359,12 +373,14 @@ def session_search(
             return await asyncio.gather(*coros, return_exceptions=True)
 
         try:
-            asyncio.get_running_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                results = pool.submit(lambda: asyncio.run(_summarize_all())).result(timeout=60)
-        except RuntimeError:
-            # No event loop running, create a new one
-            results = asyncio.run(_summarize_all())
+            # Use _run_async() which properly manages event loops across
+            # CLI, gateway, and worker-thread contexts.  The previous
+            # pattern (asyncio.run() in a ThreadPoolExecutor) created a
+            # disposable event loop that conflicted with cached
+            # AsyncOpenAI/httpx clients bound to a different loop,
+            # causing deadlocks in gateway mode (#2681).
+            from model_tools import _run_async
+            results = _run_async(_summarize_all())
         except concurrent.futures.TimeoutError:
             logging.warning(
                 "Session summarization timed out after 60 seconds",
@@ -376,23 +392,30 @@ def session_search(
             }, ensure_ascii=False)
 
         summaries = []
-        for (session_id, match_info, _, _), result in zip(tasks, results):
+        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
             if isinstance(result, Exception):
                 logging.warning(
                     "Failed to summarize session %s: %s",
-                    session_id,
-                    result,
-                    exc_info=True,
+                    session_id, result, exc_info=True,
                 )
-                continue
+                result = None
+
+            entry = {
+                "session_id": session_id,
+                "when": _format_timestamp(match_info.get("session_started")),
+                "source": match_info.get("source", "unknown"),
+                "model": match_info.get("model"),
+            }
+
             if result:
-                summaries.append({
-                    "session_id": session_id,
-                    "when": _format_timestamp(match_info.get("session_started")),
-                    "source": match_info.get("source", "unknown"),
-                    "model": match_info.get("model"),
-                    "summary": result,
-                })
+                entry["summary"] = result
+            else:
+                # Fallback: raw preview so matched sessions aren't silently
+                # dropped when the summarizer is unavailable (fixes #3409).
+                preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
+                entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
+
+            summaries.append(entry)
 
         return json.dumps({
             "success": True,
@@ -404,7 +427,7 @@ def session_search(
 
     except Exception as e:
         logging.error("Session search failed: %s", e, exc_info=True)
-        return json.dumps({"success": False, "error": f"Search failed: {str(e)}"}, ensure_ascii=False)
+        return tool_error(f"Search failed: {str(e)}", success=False)
 
 
 def check_session_search_requirements() -> bool:
@@ -464,7 +487,7 @@ SESSION_SEARCH_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 registry.register(
     name="session_search",
