@@ -182,7 +182,8 @@ Hermes ships with built-in personalities you can switch to with `/personality`.
 | **creative** | Innovative, outside-the-box thinking |
 | **teacher** | Patient educator with clear examples |
 | **kawaii** | Cute expressions, sparkles, and enthusiasm ★ |
-| **catgirl** | Neko-chan with cat-like expressions, nya~ |
+| **catboy** | Neko-kun with cat-like expressions, nya~ |
+| **chaoscat** | Hyper catboy energy — kawaii + hype + a lil uwu, ALL CAPS included |
 | **pirate** | Captain Hermes, tech-savvy buccaneer |
 | **shakespeare** | Bardic prose with dramatic flair |
 | **surfer** | Totally chill bro vibes |
