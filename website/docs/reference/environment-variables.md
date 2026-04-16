@@ -31,12 +31,17 @@ All variables go in `~/.hermes/.env`. You can also set them with `hermes config 
 | `GLM_BASE_URL` | Override z.ai base URL (default: `https://api.z.ai/api/paas/v4`) |
 | `KIMI_API_KEY` | Kimi / Moonshot AI API key ([moonshot.ai](https://platform.moonshot.ai)) |
 | `KIMI_BASE_URL` | Override Kimi base URL (default: `https://api.moonshot.ai/v1`) |
+| `KIMI_CN_API_KEY` | Kimi / Moonshot China API key ([moonshot.cn](https://platform.moonshot.cn)) |
+| `ARCEEAI_API_KEY` | Arcee AI API key ([chat.arcee.ai](https://chat.arcee.ai/)) |
+| `ARCEE_BASE_URL` | Override Arcee base URL (default: `https://api.arcee.ai/api/v1`) |
 | `MINIMAX_API_KEY` | MiniMax API key — global endpoint ([minimax.io](https://www.minimax.io)) |
 | `MINIMAX_BASE_URL` | Override MiniMax base URL (default: `https://api.minimax.io/v1`) |
 | `MINIMAX_CN_API_KEY` | MiniMax API key — China endpoint ([minimaxi.com](https://www.minimaxi.com)) |
 | `MINIMAX_CN_BASE_URL` | Override MiniMax China base URL (default: `https://api.minimaxi.com/v1`) |
 | `KILOCODE_API_KEY` | Kilo Code API key ([kilo.ai](https://kilo.ai)) |
 | `KILOCODE_BASE_URL` | Override Kilo Code base URL (default: `https://api.kilo.ai/api/gateway`) |
+| `XIAOMI_API_KEY` | Xiaomi MiMo API key ([platform.xiaomimimo.com](https://platform.xiaomimimo.com)) |
+| `XIAOMI_BASE_URL` | Override Xiaomi MiMo base URL (default: `https://api.xiaomimimo.com/v1`) |
 | `HF_TOKEN` | Hugging Face token for Inference Providers ([huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)) |
 | `HF_BASE_URL` | Override Hugging Face base URL (default: `https://router.huggingface.co/v1`) |
 | `GOOGLE_API_KEY` | Google AI Studio API key ([aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)) |
@@ -53,8 +58,7 @@ All variables go in `~/.hermes/.env`. You can also set them with `hermes config 
 | `OPENCODE_GO_API_KEY` | OpenCode Go API key — $10/month subscription for open models ([opencode.ai](https://opencode.ai/auth)) |
 | `OPENCODE_GO_BASE_URL` | Override OpenCode Go base URL |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Explicit Claude Code token override if you export one manually |
-| `HERMES_MODEL` | Preferred model name (checked before `LLM_MODEL`, used by gateway) |
-| `LLM_MODEL` | Default model name (fallback when not set in config.yaml) |
+| `HERMES_MODEL` | Override model name at process level (used by cron scheduler; prefer `config.yaml` for normal use) |
 | `VOICE_TOOLS_OPENAI_KEY` | Preferred OpenAI key for OpenAI speech-to-text and text-to-speech providers |
 | `HERMES_LOCAL_STT_COMMAND` | Optional local speech-to-text command template. Supports `{input_path}`, `{output_dir}`, `{language}`, and `{model}` placeholders |
 | `HERMES_LOCAL_STT_LANGUAGE` | Default language passed to `HERMES_LOCAL_STT_COMMAND` or auto-detected local `whisper` CLI fallback (default: `en`) |
@@ -66,7 +70,7 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 
 | Variable | Description |
 |----------|-------------|
-| `HERMES_INFERENCE_PROVIDER` | Override provider selection: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `kilocode`, `alibaba`, `deepseek`, `opencode-zen`, `opencode-go`, `ai-gateway` (default: `auto`) |
+| `HERMES_INFERENCE_PROVIDER` | Override provider selection: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `kilocode`, `xiaomi`, `arcee`, `alibaba`, `deepseek`, `opencode-zen`, `opencode-go`, `ai-gateway` (default: `auto`) |
 | `HERMES_PORTAL_BASE_URL` | Override Nous Portal URL (for development/testing) |
 | `NOUS_INFERENCE_BASE_URL` | Override Nous inference API URL |
 | `HERMES_NOUS_MIN_KEY_TTL_SECONDS` | Min agent key TTL before re-mint (default: 1800 = 30min) |
@@ -165,6 +169,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `TELEGRAM_WEBHOOK_PORT` | Local listen port for webhook server (default: `8443`) |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret token for verifying updates come from Telegram |
 | `TELEGRAM_REACTIONS` | Enable emoji reactions on messages during processing (default: `false`) |
+| `TELEGRAM_IGNORED_THREADS` | Comma-separated Telegram forum topic/thread IDs where the bot never responds |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `DISCORD_ALLOWED_USERS` | Comma-separated Discord user IDs allowed to use the bot |
 | `DISCORD_HOME_CHANNEL` | Default Discord channel for cron delivery |
@@ -194,9 +199,12 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `SIGNAL_IGNORE_STORIES` | Ignore Signal stories/status updates |
 | `SIGNAL_ALLOW_ALL_USERS` | Allow all Signal users without an allowlist |
 | `TWILIO_ACCOUNT_SID` | Twilio Account SID (shared with telephony skill) |
-| `TWILIO_AUTH_TOKEN` | Twilio Auth Token (shared with telephony skill) |
+| `TWILIO_AUTH_TOKEN` | Twilio Auth Token (shared with telephony skill; also used for webhook signature validation) |
 | `TWILIO_PHONE_NUMBER` | Twilio phone number in E.164 format (shared with telephony skill) |
+| `SMS_WEBHOOK_URL` | Public URL for Twilio signature validation — must match the webhook URL in Twilio Console (required) |
 | `SMS_WEBHOOK_PORT` | Webhook listener port for inbound SMS (default: `8080`) |
+| `SMS_WEBHOOK_HOST` | Webhook bind address (default: `0.0.0.0`) |
+| `SMS_INSECURE_NO_SIGNATURE` | Set to `true` to disable Twilio signature validation (local dev only — not for production) |
 | `SMS_ALLOWED_USERS` | Comma-separated E.164 phone numbers allowed to chat |
 | `SMS_ALLOW_ALL_USERS` | Allow all SMS senders without an allowlist |
 | `SMS_HOME_CHANNEL` | Phone number for cron job / notification delivery |
@@ -228,6 +236,42 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `WECOM_WEBSOCKET_URL` | Custom WebSocket URL (default: `wss://openws.work.weixin.qq.com`) |
 | `WECOM_ALLOWED_USERS` | Comma-separated WeCom user IDs allowed to message the bot |
 | `WECOM_HOME_CHANNEL` | WeCom chat ID for cron delivery and notifications |
+| `WECOM_CALLBACK_CORP_ID` | WeCom enterprise Corp ID for callback self-built app |
+| `WECOM_CALLBACK_CORP_SECRET` | Corp secret for the self-built app |
+| `WECOM_CALLBACK_AGENT_ID` | Agent ID of the self-built app |
+| `WECOM_CALLBACK_TOKEN` | Callback verification token |
+| `WECOM_CALLBACK_ENCODING_AES_KEY` | AES key for callback encryption |
+| `WECOM_CALLBACK_HOST` | Callback server bind address (default: `0.0.0.0`) |
+| `WECOM_CALLBACK_PORT` | Callback server port (default: `8645`) |
+| `WECOM_CALLBACK_ALLOWED_USERS` | Comma-separated user IDs for allowlist |
+| `WECOM_CALLBACK_ALLOW_ALL_USERS` | Set `true` to allow all users without an allowlist |
+| `WEIXIN_ACCOUNT_ID` | Weixin account ID obtained via QR login through iLink Bot API |
+| `WEIXIN_TOKEN` | Weixin authentication token obtained via QR login through iLink Bot API |
+| `WEIXIN_BASE_URL` | Override Weixin iLink Bot API base URL (default: `https://ilinkai.weixin.qq.com`) |
+| `WEIXIN_CDN_BASE_URL` | Override Weixin CDN base URL for media (default: `https://novac2c.cdn.weixin.qq.com/c2c`) |
+| `WEIXIN_DM_POLICY` | Direct message policy: `open`, `allowlist`, `pairing`, `disabled` (default: `open`) |
+| `WEIXIN_GROUP_POLICY` | Group message policy: `open`, `allowlist`, `disabled` (default: `disabled`) |
+| `WEIXIN_ALLOWED_USERS` | Comma-separated Weixin user IDs allowed to DM the bot |
+| `WEIXIN_GROUP_ALLOWED_USERS` | Comma-separated Weixin group IDs allowed to interact with the bot |
+| `WEIXIN_HOME_CHANNEL` | Weixin chat ID for cron delivery and notifications |
+| `WEIXIN_HOME_CHANNEL_NAME` | Display name for the Weixin home channel |
+| `WEIXIN_ALLOW_ALL_USERS` | Allow all Weixin users without an allowlist (`true`/`false`) |
+| `BLUEBUBBLES_SERVER_URL` | BlueBubbles server URL (e.g. `http://192.168.1.10:1234`) |
+| `BLUEBUBBLES_PASSWORD` | BlueBubbles server password |
+| `BLUEBUBBLES_WEBHOOK_HOST` | Webhook listener bind address (default: `127.0.0.1`) |
+| `BLUEBUBBLES_WEBHOOK_PORT` | Webhook listener port (default: `8645`) |
+| `BLUEBUBBLES_HOME_CHANNEL` | Phone/email for cron/notification delivery |
+| `BLUEBUBBLES_ALLOWED_USERS` | Comma-separated authorized users |
+| `BLUEBUBBLES_ALLOW_ALL_USERS` | Allow all users (`true`/`false`) |
+| `QQ_APP_ID` | QQ Bot App ID from [q.qq.com](https://q.qq.com) |
+| `QQ_CLIENT_SECRET` | QQ Bot App Secret from [q.qq.com](https://q.qq.com) |
+| `QQ_STT_API_KEY` | API key for external STT fallback provider (optional, used when QQ built-in ASR returns no text) |
+| `QQ_STT_BASE_URL` | Base URL for external STT provider (optional) |
+| `QQ_STT_MODEL` | Model name for external STT provider (optional) |
+| `QQ_ALLOWED_USERS` | Comma-separated QQ user openIDs allowed to message the bot |
+| `QQ_GROUP_ALLOWED_USERS` | Comma-separated QQ group IDs for group @-message access |
+| `QQ_ALLOW_ALL_USERS` | Allow all users (`true`/`false`, overrides `QQ_ALLOWED_USERS`) |
+| `QQ_HOME_CHANNEL` | QQ user/group openID for cron delivery and notifications |
 | `MATTERMOST_URL` | Mattermost server URL (e.g. `https://mm.example.com`) |
 | `MATTERMOST_TOKEN` | Bot token or personal access token for Mattermost |
 | `MATTERMOST_ALLOWED_USERS` | Comma-separated Mattermost user IDs allowed to message the bot |
@@ -245,16 +289,21 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `MATRIX_REQUIRE_MENTION` | Require `@mention` in rooms (default: `true`). Set to `false` to respond to all messages. |
 | `MATRIX_FREE_RESPONSE_ROOMS` | Comma-separated room IDs where bot responds without `@mention` |
 | `MATRIX_AUTO_THREAD` | Auto-create threads for room messages (default: `true`) |
+| `MATRIX_DM_MENTION_THREADS` | Create a thread when bot is `@mentioned` in a DM (default: `false`) |
+| `MATRIX_RECOVERY_KEY` | Recovery key for cross-signing verification after device key rotation. Recommended for E2EE setups with cross-signing enabled. |
 | `HASS_TOKEN` | Home Assistant Long-Lived Access Token (enables HA platform + tools) |
 | `HASS_URL` | Home Assistant URL (default: `http://homeassistant.local:8123`) |
 | `WEBHOOK_ENABLED` | Enable the webhook platform adapter (`true`/`false`) |
 | `WEBHOOK_PORT` | HTTP server port for receiving webhooks (default: `8644`) |
 | `WEBHOOK_SECRET` | Global HMAC secret for webhook signature validation (used as fallback when routes don't specify their own) |
 | `API_SERVER_ENABLED` | Enable the OpenAI-compatible API server (`true`/`false`). Runs alongside other platforms. |
-| `API_SERVER_KEY` | Bearer token for API server authentication. Strongly recommended; required for any network-accessible deployment. |
+| `API_SERVER_KEY` | Bearer token for API server authentication. Enforced for non-loopback binding. |
 | `API_SERVER_CORS_ORIGINS` | Comma-separated browser origins allowed to call the API server directly (for example `http://localhost:3000,http://127.0.0.1:3000`). Default: disabled. |
 | `API_SERVER_PORT` | Port for the API server (default: `8642`) |
-| `API_SERVER_HOST` | Host/bind address for the API server (default: `127.0.0.1`). Use `0.0.0.0` for network access only with `API_SERVER_KEY` and a narrow `API_SERVER_CORS_ORIGINS` allowlist. |
+| `API_SERVER_HOST` | Host/bind address for the API server (default: `127.0.0.1`). Use `0.0.0.0` for network access — requires `API_SERVER_KEY` and a narrow `API_SERVER_CORS_ORIGINS` allowlist. |
+| `API_SERVER_MODEL_NAME` | Model name advertised on `/v1/models`. Defaults to the profile name (or `hermes-agent` for the default profile). Useful for multi-user setups where frontends like Open WebUI need distinct model names per connection. |
+| `GATEWAY_PROXY_URL` | URL of a remote Hermes API server to forward messages to ([proxy mode](/docs/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos)). When set, the gateway handles platform I/O only — all agent work is delegated to the remote server. Also configurable via `gateway.proxy_url` in `config.yaml`. |
+| `GATEWAY_PROXY_KEY` | Bearer token for authenticating with the remote API server in proxy mode. Must match `API_SERVER_KEY` on the remote host. |
 | `MESSAGING_CWD` | Working directory for terminal commands in messaging mode (default: `~`) |
 | `GATEWAY_ALLOWED_USERS` | Comma-separated user IDs allowed across all platforms |
 | `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlists (`true`/`false`, default: `false`) |
@@ -271,10 +320,19 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `HERMES_HUMAN_DELAY_MAX_MS` | Custom delay range maximum (ms) |
 | `HERMES_QUIET` | Suppress non-essential output (`true`/`false`) |
 | `HERMES_API_TIMEOUT` | LLM API call timeout in seconds (default: `1800`) |
+| `HERMES_STREAM_READ_TIMEOUT` | Streaming socket read timeout in seconds (default: `120`). Auto-increased to `HERMES_API_TIMEOUT` for local providers. Increase if local LLMs time out during long code generation. |
+| `HERMES_STREAM_STALE_TIMEOUT` | Stale stream detection timeout in seconds (default: `180`). Auto-disabled for local providers. Triggers connection kill if no chunks arrive within this window. |
 | `HERMES_EXEC_ASK` | Enable execution approval prompts in gateway mode (`true`/`false`) |
 | `HERMES_ENABLE_PROJECT_PLUGINS` | Enable auto-discovery of repo-local plugins from `./.hermes/plugins/` (`true`/`false`, default: `false`) |
 | `HERMES_BACKGROUND_NOTIFICATIONS` | Background process notification mode in gateway: `all` (default), `result`, `error`, `off` |
 | `HERMES_EPHEMERAL_SYSTEM_PROMPT` | Ephemeral system prompt injected at API-call time (never persisted to sessions) |
+
+## Cron Scheduler
+
+| Variable | Description |
+|----------|-------------|
+| `HERMES_CRON_TIMEOUT` | Inactivity timeout for cron job agent runs in seconds (default: `600`). The agent can run indefinitely while actively calling tools or receiving stream tokens — this only triggers when idle. Set to `0` for unlimited. |
+| `HERMES_CRON_SCRIPT_TIMEOUT` | Timeout for pre-run scripts attached to cron jobs in seconds (default: `120`). Override for scripts that need longer execution (e.g., randomized delays for anti-bot timing). Also configurable via `cron.script_timeout_seconds` in `config.yaml`. |
 
 ## Session Settings
 
@@ -285,16 +343,19 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 
 ## Context Compression (config.yaml only)
 
-Context compression is configured exclusively through the `compression` section in `config.yaml` — there are no environment variables for it.
+Context compression is configured exclusively through `config.yaml` — there are no environment variables for it. Threshold settings live in the `compression:` block, while the summarization model/provider lives under `auxiliary.compression:`.
 
 ```yaml
 compression:
   enabled: true
   threshold: 0.50
-  summary_model: ""                            # empty = use main configured model
-  summary_provider: auto
-  summary_base_url: null  # Custom OpenAI-compatible endpoint for summaries
+  target_ratio: 0.20         # fraction of threshold to preserve as recent tail
+  protect_last_n: 20         # minimum recent messages to keep uncompressed
 ```
+
+:::info Legacy migration
+Older configs with `compression.summary_model`, `compression.summary_provider`, and `compression.summary_base_url` are automatically migrated to `auxiliary.compression.*` on first load.
+:::
 
 ## Auxiliary Task Overrides
 

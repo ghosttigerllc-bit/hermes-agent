@@ -54,7 +54,15 @@ def get_camofox_url() -> str:
 
 
 def is_camofox_mode() -> bool:
-    """True when Camofox backend is configured."""
+    """True when Camofox backend is configured and no CDP override is active.
+
+    When the user has explicitly connected to a live Chrome instance via
+    ``/browser connect`` (which sets ``BROWSER_CDP_URL``), the CDP connection
+    takes priority over Camofox so the browser tools operate on the real
+    browser instead of being silently routed to the Camofox backend.
+    """
+    if os.getenv("BROWSER_CDP_URL", "").strip():
+        return False
     return bool(get_camofox_url())
 
 
@@ -589,18 +597,4 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
     })
 
 
-# ---------------------------------------------------------------------------
-# Cleanup
-# ---------------------------------------------------------------------------
 
-def cleanup_all_camofox_sessions() -> None:
-    """Close all active camofox sessions."""
-    with _sessions_lock:
-        sessions = list(_sessions.items())
-    for task_id, session in sessions:
-        try:
-            _delete(f"/sessions/{session['user_id']}")
-        except Exception:
-            pass
-    with _sessions_lock:
-        _sessions.clear()

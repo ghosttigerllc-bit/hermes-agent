@@ -6,6 +6,7 @@ Provides options for:
 - Keep data: Remove code but keep ~/.hermes/ (configs, sessions, logs)
 """
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -121,6 +122,10 @@ def uninstall_gateway_service():
     import platform
     
     if platform.system() != "Linux":
+        return False
+
+    prefix = os.getenv("PREFIX", "")
+    if os.getenv("TERMUX_VERSION") or "com.termux/files/usr" in prefix:
         return False
     
     try:

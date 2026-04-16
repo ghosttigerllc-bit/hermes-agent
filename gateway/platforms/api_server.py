@@ -10,6 +10,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
+- GET  /health/detailed            — rich status for cross-container dashboard probing
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
@@ -20,10 +21,13 @@ Requires:
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import os
+import socket as _socket
+import re
 import sqlite3
 import time
 import uuid
@@ -40,6 +44,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+    is_network_accessible,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +54,67 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
+MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+
+def _normalize_chat_content(
+    content: Any, *, _max_depth: int = 10, _depth: int = 0,
+) -> str:
+    """Normalize OpenAI chat message content into a plain text string.
+
+    Some clients (Open WebUI, LobeChat, etc.) send content as an array of
+    typed parts instead of a plain string::
+
+        [{"type": "text", "text": "hello"}, {"type": "input_text", "text": "..."}]
+
+    This function flattens those into a single string so the agent pipeline
+    (which expects strings) doesn't choke.
+
+    Defensive limits prevent abuse: recursion depth, list size, and output
+    length are all bounded.
+    """
+    if _depth > _max_depth:
+        return ""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+        for item in items:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item[:MAX_NORMALIZED_TEXT_LENGTH])
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in {"text", "input_text", "output_text"}:
+                    text = item.get("text", "")
+                    if text:
+                        try:
+                            parts.append(str(text)[:MAX_NORMALIZED_TEXT_LENGTH])
+                        except Exception:
+                            pass
+                # Silently skip image_url / other non-text parts
+            elif isinstance(item, list):
+                nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
+                if nested:
+                    parts.append(nested)
+            # Check accumulated size
+            if sum(len(p) for p in parts) >= MAX_NORMALIZED_TEXT_LENGTH:
+                break
+        result = "\n".join(parts)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+
+    # Fallback for unexpected types (int, float, bool, etc.)
+    try:
+        result = str(content)
+        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+    except Exception:
+        return ""
 
 
 def check_api_server_requirements() -> bool:
@@ -282,6 +348,24 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _derive_chat_session_id(
+    system_prompt: Optional[str],
+    first_user_message: str,
+) -> str:
+    """Derive a stable session ID from the conversation's first user message.
+
+    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
+    conversation history with every request.  The system prompt and first user
+    message are constant across all turns of the same conversation, so hashing
+    them produces a deterministic session ID that lets the API server reuse
+    the same Hermes session (and therefore the same Docker container sandbox
+    directory) across turns.
+    """
+    seed = f"{system_prompt or ''}\n{first_user_message}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+    return f"api-{digest}"
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -298,6 +382,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
+        )
+        self._model_name: str = self._resolve_model_name(
+            extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -323,6 +410,26 @@ class APIServerAdapter(BasePlatformAdapter):
             items = [str(value)]
 
         return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @staticmethod
+    def _resolve_model_name(explicit: str) -> str:
+        """Derive the advertised model name for /v1/models.
+
+        Priority:
+        1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
+        2. Active profile name (so each profile advertises a distinct model)
+        3. Fallback: "hermes-agent"
+        """
+        if explicit and explicit.strip():
+            return explicit.strip()
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile and profile not in ("default", "custom"):
+                return profile
+        except Exception:
+            pass
+        return "hermes-agent"
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -363,7 +470,8 @@ class APIServerAdapter(BasePlatformAdapter):
         Validate Bearer token from Authorization header.
 
         Returns None if auth is OK, or a 401 web.Response on failure.
-        If no API key is configured, all requests are allowed.
+        If no API key is configured, all requests are allowed (only when API
+        server is local).
         """
         if not self._api_key:
             return None  # No key configured — allow all (local-only use)
@@ -407,6 +515,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -445,6 +555,8 @@ class APIServerAdapter(BasePlatformAdapter):
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            tool_start_callback=tool_start_callback,
+            tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -458,6 +570,27 @@ class APIServerAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
 
+    async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
+        """GET /health/detailed — rich status for cross-container dashboard probing.
+
+        Returns gateway state, connected platforms, PID, and uptime so the
+        dashboard can display full status without needing a shared PID file or
+        /proc access.  No authentication required.
+        """
+        from gateway.status import read_runtime_status
+
+        runtime = read_runtime_status() or {}
+        return web.json_response({
+            "status": "ok",
+            "platform": "hermes-agent",
+            "gateway_state": runtime.get("gateway_state"),
+            "platforms": runtime.get("platforms", {}),
+            "active_agents": runtime.get("active_agents", 0),
+            "exit_reason": runtime.get("exit_reason"),
+            "updated_at": runtime.get("updated_at"),
+            "pid": os.getpid(),
+        })
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -468,12 +601,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "data": [
                 {
-                    "id": "hermes-agent",
+                    "id": self._model_name,
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "hermes",
                     "permission": [],
-                    "root": "hermes-agent",
+                    "root": self._model_name,
                     "parent": None,
                 }
             ],
@@ -506,7 +639,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = _normalize_chat_content(msg.get("content", ""))
             if role == "system":
                 # Accumulate system messages
                 if system_prompt is None:
@@ -531,8 +664,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
+        #
+        # Security: session continuation exposes conversation history, so it is
+        # only allowed when the API key is configured and the request is
+        # authenticated.  Without this gate, any unauthenticated client could
+        # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity."
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication. "
+                        "Configure API_SERVER_KEY to enable this feature."
+                    ),
+                    status=403,
+                )
+            # Sanitize: reject control characters that could enable header injection.
+            if re.search(r'[\r\n\x00]', provided_session_id):
+                return web.json_response(
+                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                    status=400,
+                )
             session_id = provided_session_id
             try:
                 db = self._ensure_session_db()
@@ -542,11 +699,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
         else:
-            session_id = str(uuid.uuid4())
+            # Derive a stable session ID from the conversation fingerprint so
+            # that consecutive messages from the same Open WebUI (or similar)
+            # conversation map to the same Hermes session.  The first user
+            # message + system prompt are constant across all turns.
+            first_user = ""
+            for cm in conversation_messages:
+                if cm.get("role") == "user":
+                    first_user = cm.get("content", "")
+                    break
+            session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", "hermes-agent")
+        model_name = body.get("model", self._model_name)
         created = int(time.time())
 
         if stream:
@@ -565,15 +731,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Inject tool progress into the SSE stream for Open WebUI."""
+                """Send tool progress as a separate SSE event.
+
+                Previously, progress markers like ``⏰ list`` were injected
+                directly into ``delta.content``.  OpenAI-compatible frontends
+                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
+                the assistant message and send it back on subsequent requests.
+                After enough turns the model learns to *emit* the markers as
+                plain text instead of issuing real tool calls — silently
+                hallucinating tool results.  See #6972.
+
+                The fix: push a tagged tuple ``("__tool_progress__", payload)``
+                onto the stream queue.  The SSE writer emits it as a custom
+                ``event: hermes.tool.progress`` line that compliant frontends
+                can render for UX but will *not* persist into conversation
+                history.  Clients that don't understand the custom event type
+                silently ignore it per the SSE specification.
+                """
                 if event_type != "tool.started":
-                    return  # Only show tool start events in chat stream
+                    return
                 if name.startswith("_"):
-                    return  # Skip internal events (_thinking)
+                    return
                 from agent.display import get_tool_emoji
                 emoji = get_tool_emoji(name)
                 label = preview or name
-                _stream_q.put(f"\n`{emoji} {label}`\n")
+                _stream_q.put(("__tool_progress__", {
+                    "tool": name,
+                    "emoji": emoji,
+                    "label": label,
+                }))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -663,7 +849,11 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         import queue as _q
 
-        sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
         # CORS middleware can't inject headers into StreamResponse after
         # prepare() flushes them, so resolve CORS headers up front.
         origin = request.headers.get("Origin", "")
@@ -676,6 +866,8 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
+            last_activity = time.monotonic()
+
             # Role chunk
             role_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -683,6 +875,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+            last_activity = time.monotonic()
+
+            # Helper — route a queue item to the correct SSE event.
+            async def _emit(item):
+                """Write a single queue item to the SSE stream.
+
+                Plain strings are sent as normal ``delta.content`` chunks.
+                Tagged tuples ``("__tool_progress__", payload)`` are sent
+                as a custom ``event: hermes.tool.progress`` SSE event so
+                frontends can display them without storing the markers in
+                conversation history.  See #6972.
+                """
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                else:
+                    content_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
@@ -697,26 +914,19 @@ class APIServerAdapter(BasePlatformAdapter):
                                 delta = stream_q.get_nowait()
                                 if delta is None:
                                     break
-                                content_chunk = {
-                                    "id": completion_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                                }
-                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                last_activity = await _emit(delta)
                             except _q.Empty:
                                 break
                         break
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
                     continue
 
                 if delta is None:  # End of stream sentinel
                     break
 
-                content_chunk = {
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                }
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                last_activity = await _emit(delta)
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -756,6 +966,427 @@ class APIServerAdapter(BasePlatformAdapter):
                 except (asyncio.CancelledError, Exception):
                     pass
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+
+        return response
+
+    async def _write_sse_responses(
+        self,
+        request: "web.Request",
+        response_id: str,
+        model: str,
+        created_at: int,
+        stream_q,
+        agent_task,
+        agent_ref,
+        conversation_history: List[Dict[str, str]],
+        user_message: str,
+        instructions: Optional[str],
+        conversation: Optional[str],
+        store: bool,
+        session_id: str,
+    ) -> "web.StreamResponse":
+        """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
+
+        Emits spec-compliant event types as the agent runs:
+
+        - ``response.created`` — initial envelope (status=in_progress)
+        - ``response.output_text.delta`` / ``response.output_text.done`` —
+          streamed assistant text
+        - ``response.output_item.added`` / ``response.output_item.done``
+          with ``item.type == "function_call"`` — when the agent invokes a
+          tool (both events fire; the ``done`` event carries the finalized
+          ``arguments`` string)
+        - ``response.output_item.added`` with
+          ``item.type == "function_call_output"`` — tool result with
+          ``{call_id, output, status}``
+        - ``response.completed`` — terminal event carrying the full
+          response object with all output items + usage (same payload
+          shape as the non-streaming path for parity)
+        - ``response.failed`` — terminal event on agent error
+
+        If the client disconnects mid-stream, ``agent.interrupt()`` is
+        called so the agent stops issuing upstream LLM calls, then the
+        asyncio task is cancelled.  When ``store=True`` the full response
+        is persisted to the ResponseStore in a ``finally`` block so GET
+        /v1/responses/{id} and ``previous_response_id`` chaining work the
+        same as the batch path.
+        """
+        import queue as _q
+
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        if session_id:
+            sse_headers["X-Hermes-Session-Id"] = session_id
+        response = web.StreamResponse(status=200, headers=sse_headers)
+        await response.prepare(request)
+
+        # State accumulated during the stream
+        final_text_parts: List[str] = []
+        # Track open function_call items by name so we can emit a matching
+        # ``done`` event when the tool completes.  Order preserved.
+        pending_tool_calls: List[Dict[str, Any]] = []
+        # Output items we've emitted so far (used to build the terminal
+        # response.completed payload).  Kept in the order they appeared.
+        emitted_items: List[Dict[str, Any]] = []
+        # Monotonic counter for output_index (spec requires it).
+        output_index = 0
+        # Monotonic counter for call_id generation if the agent doesn't
+        # provide one (it doesn't, from tool_progress_callback).
+        call_counter = 0
+        # Canonical Responses SSE events include a monotonically increasing
+        # sequence_number. Add it server-side for every emitted event so
+        # clients that validate the OpenAI event schema can parse our stream.
+        sequence_number = 0
+        # Track the assistant message item id + content index for text
+        # delta events — the spec ties deltas to a specific item.
+        message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+        message_output_index: Optional[int] = None
+        message_opened = False
+
+        async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
+            nonlocal sequence_number
+            if "sequence_number" not in data:
+                data["sequence_number"] = sequence_number
+            sequence_number += 1
+            payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+            await response.write(payload.encode())
+
+        def _envelope(status: str) -> Dict[str, Any]:
+            env: Dict[str, Any] = {
+                "id": response_id,
+                "object": "response",
+                "status": status,
+                "created_at": created_at,
+                "model": model,
+            }
+            return env
+
+        final_response_text = ""
+        agent_error: Optional[str] = None
+        usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        try:
+            # response.created — initial envelope, status=in_progress
+            created_env = _envelope("in_progress")
+            created_env["output"] = []
+            await _write_event("response.created", {
+                "type": "response.created",
+                "response": created_env,
+            })
+            last_activity = time.monotonic()
+
+            async def _open_message_item() -> None:
+                """Emit response.output_item.added for the assistant message
+                the first time any text delta arrives."""
+                nonlocal message_opened, message_output_index, output_index
+                if message_opened:
+                    return
+                message_opened = True
+                message_output_index = output_index
+                output_index += 1
+                item = {
+                    "id": message_item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                }
+                await _write_event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": message_output_index,
+                    "item": item,
+                })
+
+            async def _emit_text_delta(delta_text: str) -> None:
+                await _open_message_item()
+                final_text_parts.append(delta_text)
+                await _write_event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": message_item_id,
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "delta": delta_text,
+                    "logprobs": [],
+                })
+
+            async def _emit_tool_started(payload: Dict[str, Any]) -> str:
+                """Emit response.output_item.added for a function_call.
+
+                Returns the call_id so the matching completion event can
+                reference it.  Prefer the real ``tool_call_id`` from the
+                agent when available; fall back to a generated call id for
+                safety in tests or older code paths.
+                """
+                nonlocal output_index, call_counter
+                call_counter += 1
+                call_id = payload.get("tool_call_id") or f"call_{response_id[5:]}_{call_counter}"
+                args = payload.get("arguments", {})
+                if isinstance(args, dict):
+                    arguments_str = json.dumps(args)
+                else:
+                    arguments_str = str(args)
+                item = {
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "name": payload.get("name", ""),
+                    "call_id": call_id,
+                    "arguments": arguments_str,
+                }
+                idx = output_index
+                output_index += 1
+                pending_tool_calls.append({
+                    "call_id": call_id,
+                    "name": payload.get("name", ""),
+                    "arguments": arguments_str,
+                    "item_id": item["id"],
+                    "output_index": idx,
+                })
+                emitted_items.append({
+                    "type": "function_call",
+                    "name": payload.get("name", ""),
+                    "arguments": arguments_str,
+                    "call_id": call_id,
+                })
+                await _write_event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": item,
+                })
+                return call_id
+
+            async def _emit_tool_completed(payload: Dict[str, Any]) -> None:
+                """Emit response.output_item.done (function_call) followed
+                by response.output_item.added (function_call_output)."""
+                nonlocal output_index
+                call_id = payload.get("tool_call_id")
+                result = payload.get("result", "")
+                pending = None
+                if call_id:
+                    for i, p in enumerate(pending_tool_calls):
+                        if p["call_id"] == call_id:
+                            pending = pending_tool_calls.pop(i)
+                            break
+                if pending is None:
+                    # Completion without a matching start — skip to avoid
+                    # emitting orphaned done events.
+                    return
+
+                # function_call done
+                done_item = {
+                    "id": pending["item_id"],
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": pending["name"],
+                    "call_id": pending["call_id"],
+                    "arguments": pending["arguments"],
+                }
+                await _write_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": pending["output_index"],
+                    "item": done_item,
+                })
+
+                # function_call_output added (result)
+                result_str = result if isinstance(result, str) else json.dumps(result)
+                output_parts = [{"type": "input_text", "text": result_str}]
+                output_item = {
+                    "id": f"fco_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call_output",
+                    "call_id": pending["call_id"],
+                    "output": output_parts,
+                    "status": "completed",
+                }
+                idx = output_index
+                output_index += 1
+                emitted_items.append({
+                    "type": "function_call_output",
+                    "call_id": pending["call_id"],
+                    "output": output_parts,
+                })
+                await _write_event("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": idx,
+                    "item": output_item,
+                })
+                await _write_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": output_item,
+                })
+
+            # Main drain loop — thread-safe queue fed by agent callbacks.
+            async def _dispatch(it) -> None:
+                """Route a queue item to the correct SSE emitter.
+
+                Plain strings are text deltas.  Tagged tuples with
+                ``__tool_started__`` / ``__tool_completed__`` prefixes
+                are tool lifecycle events.
+                """
+                if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
+                    tag, payload = it
+                    if tag == "__tool_started__":
+                        await _emit_tool_started(payload)
+                    elif tag == "__tool_completed__":
+                        await _emit_tool_completed(payload)
+                    # Unknown tags are silently ignored (forward-compat).
+                elif isinstance(it, str):
+                    await _emit_text_delta(it)
+                # Other types (non-string, non-tuple) are silently dropped.
+
+            loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                except _q.Empty:
+                    if agent_task.done():
+                        # Drain remaining
+                        while True:
+                            try:
+                                item = stream_q.get_nowait()
+                                if item is None:
+                                    break
+                                await _dispatch(item)
+                                last_activity = time.monotonic()
+                            except _q.Empty:
+                                break
+                        break
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
+                    continue
+
+                if item is None:  # EOS sentinel
+                    break
+
+                await _dispatch(item)
+                last_activity = time.monotonic()
+
+            # Pick up agent result + usage from the completed task
+            try:
+                result, agent_usage = await agent_task
+                usage = agent_usage or usage
+                # If the agent produced a final_response but no text
+                # deltas were streamed (e.g. some providers only emit
+                # the full response at the end), emit a single fallback
+                # delta so Responses clients still receive a live text part.
+                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                if agent_final and not final_text_parts:
+                    await _emit_text_delta(agent_final)
+                if agent_final and not final_response_text:
+                    final_response_text = agent_final
+                if isinstance(result, dict) and result.get("error") and not final_response_text:
+                    agent_error = result["error"]
+            except Exception as e:  # noqa: BLE001
+                logger.error("Error running agent for streaming responses: %s", e, exc_info=True)
+                agent_error = str(e)
+
+            # Close the message item if it was opened
+            final_response_text = "".join(final_text_parts) or final_response_text
+            if message_opened:
+                await _write_event("response.output_text.done", {
+                    "type": "response.output_text.done",
+                    "item_id": message_item_id,
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "text": final_response_text,
+                    "logprobs": [],
+                })
+                msg_done_item = {
+                    "id": message_item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": final_response_text}
+                    ],
+                }
+                await _write_event("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": message_output_index,
+                    "item": msg_done_item,
+                })
+
+            # Always append a final message item in the completed
+            # response envelope so clients that only parse the terminal
+            # payload still see the assistant text.  This mirrors the
+            # shape produced by _extract_output_items in the batch path.
+            final_items: List[Dict[str, Any]] = list(emitted_items)
+            final_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": final_response_text or (agent_error or "")}
+                ],
+            })
+
+            if agent_error:
+                failed_env = _envelope("failed")
+                failed_env["output"] = final_items
+                failed_env["error"] = {"message": agent_error, "type": "server_error"}
+                failed_env["usage"] = {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+                await _write_event("response.failed", {
+                    "type": "response.failed",
+                    "response": failed_env,
+                })
+            else:
+                completed_env = _envelope("completed")
+                completed_env["output"] = final_items
+                completed_env["usage"] = {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+                await _write_event("response.completed", {
+                    "type": "response.completed",
+                    "response": completed_env,
+                })
+
+                # Persist for future chaining / GET retrieval, mirroring
+                # the batch path behavior.
+                if store:
+                    full_history = list(conversation_history)
+                    full_history.append({"role": "user", "content": user_message})
+                    if isinstance(result, dict) and result.get("messages"):
+                        full_history.extend(result["messages"])
+                    else:
+                        full_history.append({"role": "assistant", "content": final_response_text})
+                    self._response_store.put(response_id, {
+                        "response": completed_env,
+                        "conversation_history": full_history,
+                        "instructions": instructions,
+                        "session_id": session_id,
+                    })
+                    if conversation:
+                        self._response_store.set_conversation(conversation, response_id)
+
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Client disconnected — interrupt the agent so it stops
+            # making upstream LLM calls, then cancel the task.
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE client disconnected")
+                except Exception:
+                    pass
+            if not agent_task.done():
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            logger.info("SSE client disconnected; interrupted agent task %s", response_id)
 
         return response
 
@@ -802,18 +1433,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = item.get("content", "")
-                    # Handle content that may be a list of content parts
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "input_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, dict) and part.get("type") == "output_text":
-                                text_parts.append(part.get("text", ""))
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "\n".join(text_parts)
+                    content = _normalize_chat_content(item.get("content", ""))
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -840,11 +1460,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
+        stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
                 return web.json_response(_openai_error(f"Previous response not found: {previous_response_id}"), status=404)
             conversation_history = list(stored.get("conversation_history", []))
+            stored_session_id = stored.get("session_id")
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
@@ -862,8 +1484,83 @@ class APIServerAdapter(BasePlatformAdapter):
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
 
-        # Run the agent (with Idempotency-Key support)
-        session_id = str(uuid.uuid4())
+        # Reuse session from previous_response_id chain so the dashboard
+        # groups the entire conversation under one session entry.
+        session_id = stored_session_id or str(uuid.uuid4())
+
+        stream = bool(body.get("stream", False))
+        if stream:
+            # Streaming branch — emit OpenAI Responses SSE events as the
+            # agent runs so frontends can render text deltas and tool
+            # calls in real time.  See _write_sse_responses for details.
+            import queue as _q
+            _stream_q: _q.Queue = _q.Queue()
+
+            def _on_delta(delta):
+                # None from the agent is a CLI box-close signal, not EOS.
+                # Forwarding would kill the SSE stream prematurely; the
+                # SSE writer detects completion via agent_task.done().
+                if delta is not None:
+                    _stream_q.put(delta)
+
+            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                """Queue non-start tool progress events if needed in future.
+
+                The structured Responses stream uses ``tool_start_callback``
+                and ``tool_complete_callback`` for exact call-id correlation,
+                so progress events are currently ignored here.
+                """
+                return
+
+            def _on_tool_start(tool_call_id, function_name, function_args):
+                """Queue a started tool for live function_call streaming."""
+                _stream_q.put(("__tool_started__", {
+                    "tool_call_id": tool_call_id,
+                    "name": function_name,
+                    "arguments": function_args or {},
+                }))
+
+            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+                """Queue a completed tool result for live function_call_output streaming."""
+                _stream_q.put(("__tool_completed__", {
+                    "tool_call_id": tool_call_id,
+                    "name": function_name,
+                    "arguments": function_args or {},
+                    "result": function_result,
+                }))
+
+            agent_ref = [None]
+            agent_task = asyncio.ensure_future(self._run_agent(
+                user_message=user_message,
+                conversation_history=conversation_history,
+                ephemeral_system_prompt=instructions,
+                session_id=session_id,
+                stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_tool_progress,
+                tool_start_callback=_on_tool_start,
+                tool_complete_callback=_on_tool_complete,
+                agent_ref=agent_ref,
+            ))
+
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            model_name = body.get("model", self._model_name)
+            created_at = int(time.time())
+
+            return await self._write_sse_responses(
+                request=request,
+                response_id=response_id,
+                model=model_name,
+                created_at=created_at,
+                stream_q=_stream_q,
+                agent_task=agent_task,
+                agent_ref=agent_ref,
+                conversation_history=conversation_history,
+                user_message=user_message,
+                instructions=instructions,
+                conversation=conversation,
+                store=store,
+                session_id=session_id,
+            )
 
         async def _compute_response():
             return await self._run_agent(
@@ -923,7 +1620,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", "hermes-agent"),
+            "model": body.get("model", self._model_name),
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -938,6 +1635,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "response": response_data,
                 "conversation_history": full_history,
                 "instructions": instructions,
+                "session_id": session_id,
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
@@ -1291,6 +1989,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -1312,12 +2012,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                task_id="default",
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1447,10 +2150,12 @@ class APIServerAdapter(BasePlatformAdapter):
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
+        stored_session_id = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
+                stored_session_id = stored.get("session_id")
                 if instructions is None:
                     instructions = stored.get("instructions")
 
@@ -1469,7 +2174,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or run_id
+        session_id = body.get("session_id") or stored_session_id or run_id
         ephemeral_system_prompt = instructions
 
         async def _run_and_close():
@@ -1484,6 +2189,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     r = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
+                        task_id="default",
                     )
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -1608,6 +2314,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
+            self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
@@ -1635,8 +2342,33 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # Refuse to start network-accessible without authentication
+            if is_network_accessible(self._host) and not self._api_key:
+                logger.error(
+                    "[%s] Refusing to start: binding to %s requires API_SERVER_KEY. "
+                    "Set API_SERVER_KEY or use the default 127.0.0.1.",
+                    self.name, self._host,
+                )
+                return False
+
+            # Refuse to start network-accessible with a placeholder key.
+            # Ported from openclaw/openclaw#64586.
+            if is_network_accessible(self._host) and self._api_key:
+                try:
+                    from hermes_cli.auth import has_usable_secret
+                    if not has_usable_secret(self._api_key, min_length=8):
+                        logger.error(
+                            "[%s] Refusing to start: API_SERVER_KEY is set to a "
+                            "placeholder value. Generate a real secret "
+                            "(e.g. `openssl rand -hex 32`) and set API_SERVER_KEY "
+                            "before exposing the API server on %s.",
+                            self.name, self._host,
+                        )
+                        return False
+                except ImportError:
+                    pass
+
             # Port conflict detection — fail fast if port is already in use
-            import socket as _socket
             try:
                 with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
                     _s.settimeout(1)
@@ -1652,9 +2384,17 @@ class APIServerAdapter(BasePlatformAdapter):
             await self._site.start()
 
             self._mark_connected()
+            if not self._api_key:
+                logger.warning(
+                    "[%s] ⚠️  No API key configured (API_SERVER_KEY / platforms.api_server.key). "
+                    "All requests will be accepted without authentication. "
+                    "Set an API key for production deployments to prevent "
+                    "unauthorized access to sessions, responses, and cron jobs.",
+                    self.name,
+                )
             logger.info(
-                "[%s] API server listening on http://%s:%d",
-                self.name, self._host, self._port,
+                "[%s] API server listening on http://%s:%d (model: %s)",
+                self.name, self._host, self._port, self._model_name,
             )
             return True
 
