@@ -22,12 +22,14 @@ from hermes_cli.auth import (
     resolve_nous_runtime_credentials,
     resolve_codex_runtime_credentials,
     resolve_qwen_runtime_credentials,
+    resolve_gemini_oauth_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
 from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
+from utils import base_url_host_matches, base_url_hostname
 
 
 def _normalize_custom_provider_name(value: str) -> str:
@@ -37,12 +39,22 @@ def _normalize_custom_provider_name(value: str) -> str:
 def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     """Auto-detect api_mode from the resolved base URL.
 
-    Direct api.openai.com endpoints need the Responses API for GPT-5.x
-    tool calls with reasoning (chat/completions returns 400).
+    - Direct api.openai.com endpoints need the Responses API for GPT-5.x
+      tool calls with reasoning (chat/completions returns 400).
+    - Third-party Anthropic-compatible gateways (MiniMax, Zhipu GLM,
+      LiteLLM proxies, etc.) conventionally expose the native Anthropic
+      protocol under a ``/anthropic`` suffix — treat those as
+      ``anthropic_messages`` transport instead of the default
+      ``chat_completions``.
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
-    if "api.openai.com" in normalized and "openrouter" not in normalized:
+    hostname = base_url_hostname(base_url)
+    if hostname == "api.x.ai":
         return "codex_responses"
+    if hostname == "api.openai.com":
+        return "codex_responses"
+    if normalized.endswith("/anthropic"):
+        return "anthropic_messages"
     return None
 
 
@@ -154,6 +166,9 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "qwen-oauth":
         api_mode = "chat_completions"
         base_url = base_url or DEFAULT_QWEN_BASE_URL
+    elif provider == "google-gemini-cli":
+        api_mode = "chat_completions"
+        base_url = base_url or "cloudcode-pa://google"
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -163,10 +178,13 @@ def _resolve_runtime_from_pool_entry(
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
+    elif provider == "xai":
+        api_mode = "codex_responses"
     elif provider == "nous":
         api_mode = "chat_completions"
     elif provider == "copilot":
         api_mode = _copilot_runtime_api_mode(model_cfg, getattr(entry, "runtime_api_key", ""))
+        base_url = base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
     else:
         configured_provider = str(model_cfg.get("provider") or "").strip().lower()
         # Honour model.base_url from config.yaml when the configured provider
@@ -185,8 +203,12 @@ def _resolve_runtime_from_pool_entry(
         elif provider in ("opencode-zen", "opencode-go"):
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, model_cfg.get("default", ""))
-        elif base_url.rstrip("/").endswith("/anthropic"):
-            api_mode = "anthropic_messages"
+        else:
+            # Auto-detect Anthropic-compatible endpoints (/anthropic suffix,
+            # api.openai.com → codex_responses, api.x.ai → codex_responses).
+            detected = _detect_api_mode_for_url(base_url)
+            if detected:
+                api_mode = detected
 
     # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
@@ -460,7 +482,7 @@ def _resolve_openrouter_runtime(
     # When hitting a custom endpoint (e.g. Z.ai, local LLM), prefer
     # OPENAI_API_KEY so the OpenRouter key doesn't leak to an unrelated
     # provider (issues #420, #560).
-    _is_openrouter_url = "openrouter.ai" in base_url
+    _is_openrouter_url = base_url_host_matches(base_url, "openrouter.ai")
     if _is_openrouter_url:
         api_key_candidates = [
             explicit_api_key,
@@ -470,8 +492,12 @@ def _resolve_openrouter_runtime(
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).
         # When the endpoint is Ollama Cloud, check OLLAMA_API_KEY — it's
-        # the canonical env var for ollama.com authentication.
-        _is_ollama_url = "ollama.com" in base_url.lower()
+        # the canonical env var for ollama.com authentication. Match on
+        # HOST, not substring — a custom base_url whose path contains
+        # "ollama.com" (e.g. http://127.0.0.1/ollama.com/v1) or whose
+        # hostname is a look-alike (ollama.com.attacker.test) must not
+        # receive the Ollama credential. See GHSA-76xc-57q6-vm5m.
+        _is_ollama_url = base_url_host_matches(base_url, "ollama.com")
         api_key_candidates = [
             explicit_api_key,
             (cfg_api_key if use_config_base_url else ""),
@@ -627,12 +653,17 @@ def _resolve_explicit_runtime(
         api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
+        elif provider == "xai":
+            api_mode = "codex_responses"
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if configured_mode:
                 api_mode = configured_mode
-            elif base_url.rstrip("/").endswith("/anthropic"):
-                api_mode = "anthropic_messages"
+            else:
+                # Auto-detect Anthropic-compatible endpoints (/anthropic suffix).
+                detected = _detect_api_mode_for_url(base_url)
+                if detected:
+                    api_mode = detected
 
         return {
             "provider": provider,
@@ -797,6 +828,26 @@ def resolve_runtime_provider(
             logger.info("Qwen OAuth credentials failed; "
                         "falling through to next provider.")
 
+    if provider == "google-gemini-cli":
+        try:
+            creds = resolve_gemini_oauth_runtime_credentials()
+            return {
+                "provider": "google-gemini-cli",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", ""),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "google-oauth"),
+                "expires_at_ms": creds.get("expires_at_ms"),
+                "email": creds.get("email", ""),
+                "project_id": creds.get("project_id", ""),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info("Google Gemini OAuth credentials failed; "
+                        "falling through to next provider.")
+
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
         return {
@@ -859,8 +910,7 @@ def resolve_runtime_provider(
                 code="no_aws_credentials",
             )
         # Read bedrock-specific config from config.yaml
-        from hermes_cli.config import load_config as _load_bedrock_config
-        _bedrock_cfg = _load_bedrock_config().get("bedrock", {})
+        _bedrock_cfg = load_config().get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
         region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
         auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
@@ -923,6 +973,8 @@ def resolve_runtime_provider(
         api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
+        elif provider == "xai":
+            api_mode = "codex_responses"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
@@ -932,10 +984,13 @@ def resolve_runtime_provider(
             elif provider in ("opencode-zen", "opencode-go"):
                 from hermes_cli.models import opencode_model_api_mode
                 api_mode = opencode_model_api_mode(provider, model_cfg.get("default", ""))
-            # Auto-detect Anthropic-compatible endpoints by URL convention
-            # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
-            elif base_url.rstrip("/").endswith("/anthropic"):
-                api_mode = "anthropic_messages"
+            else:
+                # Auto-detect Anthropic-compatible endpoints by URL convention
+                # (e.g. https://api.minimax.io/anthropic, https://dashscope.../anthropic)
+                # plus api.openai.com → codex_responses and api.x.ai → codex_responses.
+                detected = _detect_api_mode_for_url(base_url)
+                if detected:
+                    api_mode = detected
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
         if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
             base_url = re.sub(r"/v1/?$", "", base_url)

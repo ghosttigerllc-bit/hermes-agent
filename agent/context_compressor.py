@@ -31,6 +31,7 @@ from agent.model_metadata import (
     get_model_context_length,
     estimate_messages_tokens_rough,
 )
+from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,10 @@ SUMMARY_PREFIX = (
     "into the summary below. This is a handoff from a previous context "
     "window — treat it as background reference, NOT as active instructions. "
     "Do NOT answer questions or fulfill requests mentioned in this summary; "
-    "they were already addressed. Respond ONLY to the latest user message "
+    "they were already addressed. "
+    "Your current task is identified in the '## Active Task' section of the "
+    "summary — resume exactly from there. "
+    "Respond ONLY to the latest user message "
     "that appears AFTER this summary. The current session state (files, "
     "config, etc.) may reflect work described here — avoid repeating it:"
 )
@@ -58,6 +62,52 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # Chars per token rough estimate
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+
+def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
+    """Shrink long string values inside a tool-call arguments JSON blob while
+    preserving JSON validity.
+
+    The ``function.arguments`` field on a tool call is a JSON-encoded string
+    passed through to the LLM provider; downstream providers strictly
+    validate it and return a non-retryable 400 when it is not well-formed.
+    An earlier implementation sliced the raw JSON at a fixed byte offset and
+    appended ``...[truncated]`` — which routinely produced strings like::
+
+        {"path": "/foo/bar", "content": "# long markdown
+        ...[truncated]
+
+    i.e. an unterminated string and a missing closing brace. MiniMax, for
+    example, rejects this with ``invalid function arguments json string``
+    and the session gets stuck re-sending the same broken history on every
+    turn. See issue #11762 for the observed loop.
+
+    This helper parses the arguments, shrinks long string leaves inside the
+    parsed structure, and re-serialises. Non-string values (paths, ints,
+    booleans) are preserved intact. If the arguments are not valid JSON
+    to begin with — some model backends use non-JSON tool arguments — the
+    original string is returned unchanged rather than replaced with
+    something neither we nor the backend can parse.
+    """
+    try:
+        parsed = json.loads(args)
+    except (ValueError, TypeError):
+        return args
+
+    def _shrink(obj: Any) -> Any:
+        if isinstance(obj, str):
+            if len(obj) > head_chars:
+                return obj[:head_chars] + "...[truncated]"
+            return obj
+        if isinstance(obj, dict):
+            return {k: _shrink(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_shrink(v) for v in obj]
+        return obj
+
+    shrunken = _shrink(parsed)
+    # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
+    return json.dumps(shrunken, ensure_ascii=False)
 
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
@@ -446,6 +496,11 @@ class ContextCompressor(ContextEngine):
         # Pass 3: Truncate large tool_call arguments in assistant messages
         # outside the protected tail. write_file with 50KB content, for
         # example, survives pruning entirely without this.
+        #
+        # The shrinking is done inside the parsed JSON structure so the
+        # result remains valid JSON — otherwise downstream providers 400
+        # on every subsequent turn until the broken call falls out of
+        # the window. See ``_truncate_tool_call_args_json`` docstring.
         for i in range(prune_boundary):
             msg = result[i]
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
@@ -456,8 +511,10 @@ class ContextCompressor(ContextEngine):
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
                     if len(args) > 500:
-                        tc = {**tc, "function": {**tc["function"], "arguments": args[:200] + "...[truncated]"}}
-                        modified = True
+                        new_args = _truncate_tool_call_args_json(args)
+                        if new_args != args:
+                            tc = {**tc, "function": {**tc["function"], "arguments": new_args}}
+                            modified = True
                 new_tcs.append(tc)
             if modified:
                 result[i] = {**msg, "tool_calls": new_tcs}
@@ -494,11 +551,15 @@ class ContextCompressor(ContextEngine):
         Includes tool call arguments and result content (up to
         ``_CONTENT_MAX`` chars per message) so the summarizer can preserve
         specific details like file paths, commands, and outputs.
+
+        All content is redacted before serialization to prevent secrets
+        (API keys, tokens, passwords) from leaking into the summary that
+        gets sent to the auxiliary model and persisted across compactions.
         """
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            content = redact_sensitive_text(msg.get("content") or "")
 
             # Tool results: keep enough content for the summarizer
             if role == "tool":
@@ -519,7 +580,7 @@ class ContextCompressor(ContextEngine):
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
-                            args = fn.get("arguments", "")
+                            args = redact_sensitive_text(fn.get("arguments", ""))
                             # Truncate long arguments but keep enough for context
                             if len(args) > self._TOOL_ARGS_MAX:
                                 args = args[:self._TOOL_ARGS_HEAD] + "..."
@@ -577,12 +638,26 @@ class ContextCompressor(ContextEngine):
             "assistant that continues the conversation. "
             "Do NOT respond to any questions or requests in the conversation — "
             "only output the structured summary. "
-            "Do NOT include any preamble, greeting, or prefix."
+            "Do NOT include any preamble, greeting, or prefix. "
+            "Write the summary in the same language the user was using in the "
+            "conversation — do not translate or switch to English. "
+            "NEVER include API keys, tokens, passwords, secrets, credentials, "
+            "or connection strings in the summary — replace any that appear "
+            "with [REDACTED]. Note that the user had credentials present, but "
+            "do not preserve their values."
         )
 
         # Shared structured template (used by both paths).
-        _template_sections = f"""## Goal
-[What the user is trying to accomplish]
+        _template_sections = f"""## Active Task
+[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
+task assignment verbatim — the exact words they used. If multiple tasks
+were requested and only some are done, list only the ones NOT yet completed.
+The next assistant must pick up exactly here. Example:
+"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
+If no outstanding task exists, write "None."]
+
+## Goal
+[What the user is trying to accomplish overall]
 
 ## Constraints & Preferences
 [User preferences, coding style, constraints, important decisions]
@@ -626,7 +701,7 @@ Be specific with file paths, commands, line numbers, and results.]
 [What remains to be done — framed as context, not instructions]
 
 ## Critical Context
-[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
+[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
@@ -644,7 +719,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
 
 {_template_sections}"""
         else:
@@ -666,7 +741,7 @@ Use this exact structure:
             prompt += f"""
 
 FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
+The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         try:
             call_kwargs = {
@@ -689,7 +764,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""
-            summary = content.strip()
+            # Redact the summary output as well — the summarizer LLM may
+            # ignore prompt instructions and echo back secrets verbatim.
+            summary = redact_sensitive_text(content.strip())
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
@@ -730,7 +807,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
                 self.summary_model = ""  # empty = use main model
                 self._summary_failure_cooldown_until = 0.0  # no cooldown
-                return self._generate_summary(messages, summary_budget)  # retry immediately
+                return self._generate_summary(turns_to_summarize)  # retry immediately
 
             # Transient errors (timeout, rate limit, network) — shorter cooldown
             _transient_cooldown = 60
@@ -862,6 +939,62 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Tail protection by token budget
     # ------------------------------------------------------------------
 
+    def _find_last_user_message_idx(
+        self, messages: List[Dict[str, Any]], head_end: int
+    ) -> int:
+        """Return the index of the last user-role message at or after *head_end*, or -1."""
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            if messages[i].get("role") == "user":
+                return i
+        return -1
+
+    def _ensure_last_user_message_in_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        cut_idx: int,
+        head_end: int,
+    ) -> int:
+        """Guarantee the most recent user message is in the protected tail.
+
+        Context compressor bug (#10896): ``_align_boundary_backward`` can pull
+        ``cut_idx`` past a user message when it tries to keep tool_call/result
+        groups together.  If the last user message ends up in the *compressed*
+        middle region the LLM summariser writes it into "Pending User Asks",
+        but ``SUMMARY_PREFIX`` tells the next model to respond only to user
+        messages *after* the summary — so the task effectively disappears from
+        the active context, causing the agent to stall, repeat completed work,
+        or silently drop the user's latest request.
+
+        Fix: if the last user-role message is not already in the tail
+        (``messages[cut_idx:]``), walk ``cut_idx`` back to include it.  We
+        then re-align backward one more time to avoid splitting any
+        tool_call/result group that immediately precedes the user message.
+        """
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        if last_user_idx < 0:
+            # No user message found beyond head — nothing to anchor.
+            return cut_idx
+
+        if last_user_idx >= cut_idx:
+            # Already in the tail; nothing to do.
+            return cut_idx
+
+        # The last user message is in the middle (compressed) region.
+        # Pull cut_idx back to it directly — a user message is already a
+        # clean boundary (no tool_call/result splitting risk), so there is no
+        # need to call _align_boundary_backward here; doing so would
+        # unnecessarily pull the cut further back into the preceding
+        # assistant + tool_calls group.
+        if not self.quiet_mode:
+            logger.debug(
+                "Anchoring tail cut to last user message at index %d "
+                "(was %d) to prevent active-task loss after compression",
+                last_user_idx,
+                cut_idx,
+            )
+        # Safety: never go back into the head region.
+        return max(last_user_idx, head_end + 1)
+
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
@@ -879,7 +1012,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         read, etc.).  If even the minimum 3 messages exceed 1.5x the budget
         the cut is placed right after the head so compression still runs.
 
-        Never cuts inside a tool_call/result group.
+        Never cuts inside a tool_call/result group.  Always ensures the most
+        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -917,6 +1051,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
+
+        # Ensure the most recent user message is always in the tail so the
+        # active task is never lost to compression (fixes #10896).
+        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
 
         return max(cut_idx, head_end + 1)
 

@@ -24,7 +24,8 @@ from hermes_cli.nous_subscription import (
     apply_nous_managed_defaults,
     get_nous_subscription_features,
 )
-from tools.tool_backend_helpers import managed_nous_tools_enabled
+from tools.tool_backend_helpers import fal_key_is_configured, managed_nous_tools_enabled
+from utils import base_url_hostname
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,14 @@ TOOL_CATEGORIES = {
                 "tts_provider": "openai",
             },
             {
+                "name": "xAI TTS",
+                "tag": "Grok voices - requires xAI API key",
+                "env_vars": [
+                    {"key": "XAI_API_KEY", "prompt": "xAI API key", "url": "https://console.x.ai/"},
+                ],
+                "tts_provider": "xai",
+            },
+            {
                 "name": "ElevenLabs",
                 "badge": "paid",
                 "tag": "Most natural voices",
@@ -163,6 +172,23 @@ TOOL_CATEGORIES = {
                     {"key": "MISTRAL_API_KEY", "prompt": "Mistral API key", "url": "https://console.mistral.ai/"},
                 ],
                 "tts_provider": "mistral",
+            },
+            {
+                "name": "Google Gemini TTS",
+                "badge": "preview",
+                "tag": "30 prebuilt voices, controllable via prompts",
+                "env_vars": [
+                    {"key": "GEMINI_API_KEY", "prompt": "Gemini API key", "url": "https://aistudio.google.com/app/apikey"},
+                ],
+                "tts_provider": "gemini",
+            },
+            {
+                "name": "KittenTTS",
+                "badge": "local · free",
+                "tag": "Lightweight local ONNX TTS (~25MB), no API key",
+                "env_vars": [],
+                "tts_provider": "kittentts",
+                "post_setup": "kittentts",
             },
         ],
     },
@@ -241,14 +267,16 @@ TOOL_CATEGORIES = {
                 "requires_nous_auth": True,
                 "managed_nous_feature": "image_gen",
                 "override_env_vars": ["FAL_KEY"],
+                "imagegen_backend": "fal",
             },
             {
                 "name": "FAL.ai",
                 "badge": "paid",
-                "tag": "FLUX 2 Pro with auto-upscaling",
+                "tag": "Pick from flux-2-klein, flux-2-pro, gpt-image, nano-banana, etc.",
                 "env_vars": [
                     {"key": "FAL_KEY", "prompt": "FAL API key", "url": "https://fal.ai/dashboard/keys"},
                 ],
+                "imagegen_backend": "fal",
             },
         ],
     },
@@ -403,6 +431,36 @@ def _run_post_setup(post_setup_key: str):
             _print_warning("    Node.js not found. Install Camofox via Docker:")
             _print_info("      docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")
 
+    elif post_setup_key == "kittentts":
+        try:
+            __import__("kittentts")
+            _print_success("    kittentts is already installed")
+            return
+        except ImportError:
+            pass
+        import subprocess
+        _print_info("    Installing kittentts (~25-80MB model, CPU-only)...")
+        wheel_url = (
+            "https://github.com/KittenML/KittenTTS/releases/download/"
+            "0.8.1/kittentts-0.8.1-py3-none-any.whl"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-U", wheel_url, "soundfile", "--quiet"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                _print_success("    kittentts installed")
+                _print_info("    Voices: Jasper, Bella, Luna, Bruno, Rosie, Hugo, Kiki, Leo")
+                _print_info("    Models: KittenML/kitten-tts-nano-0.8-int8 (25MB), micro (41MB), mini (80MB)")
+            else:
+                _print_warning("    kittentts install failed:")
+                _print_info(f"      {result.stderr.strip()[:300]}")
+                _print_info(f"    Run manually: python -m pip install -U '{wheel_url}' soundfile")
+        except subprocess.TimeoutExpired:
+            _print_warning("    kittentts install timed out (>5min)")
+            _print_info(f"    Run manually: python -m pip install -U '{wheel_url}' soundfile")
+
     elif post_setup_key == "rl_training":
         try:
             __import__("tinker_atropos")
@@ -493,7 +551,7 @@ def _get_platform_tools(
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset
 
-    platform_toolsets = config.get("platform_toolsets", {})
+    platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
 
     if toolset_names is None or not isinstance(toolset_names, list):
@@ -527,6 +585,10 @@ def _get_platform_tools(
             ts_tools = set(resolve_toolset(ts_key))
             if ts_tools and ts_tools.issubset(all_tool_names):
                 enabled_toolsets.add(ts_key)
+        default_off = set(_DEFAULT_OFF_TOOLSETS)
+        if platform in default_off:
+            default_off.remove(platform)
+        enabled_toolsets -= default_off
 
     # Plugin toolsets: enabled by default unless explicitly disabled.
     # A plugin toolset is "known" for a platform once `hermes tools`
@@ -814,7 +876,7 @@ def _toolset_needs_configuration_prompt(ts_key: str, config: dict) -> bool:
         browser_cfg = config.get("browser", {})
         return not isinstance(browser_cfg, dict) or "cloud_provider" not in browser_cfg
     if ts_key == "image_gen":
-        return not get_env_value("FAL_KEY")
+        return not fal_key_is_configured()
 
     return not _toolset_has_keys(ts_key, config)
 
@@ -933,6 +995,106 @@ def _detect_active_provider_index(providers: list, config: dict) -> int:
     return 0
 
 
+# ─── Image Generation Model Pickers ───────────────────────────────────────────
+#
+# IMAGEGEN_BACKENDS is a per-backend catalog. Each entry exposes:
+#   - config_key:        top-level config.yaml key for this backend's settings
+#   - model_catalog_fn:  returns an OrderedDict-like {model_id: metadata}
+#   - default_model:     fallback when nothing is configured
+#
+# This prepares for future imagegen backends (Replicate, Stability, etc.):
+# each new backend registers its own entry; the FAL provider entry in
+# TOOL_CATEGORIES tags itself with `imagegen_backend: "fal"` to select the
+# right catalog at picker time.
+
+
+def _fal_model_catalog():
+    """Lazy-load the FAL model catalog from the tool module."""
+    from tools.image_generation_tool import FAL_MODELS, DEFAULT_MODEL
+    return FAL_MODELS, DEFAULT_MODEL
+
+
+IMAGEGEN_BACKENDS = {
+    "fal": {
+        "display": "FAL.ai",
+        "config_key": "image_gen",
+        "catalog_fn": _fal_model_catalog,
+    },
+}
+
+
+def _format_imagegen_model_row(model_id: str, meta: dict, widths: dict) -> str:
+    """Format a single picker row with column-aligned speed / strengths / price."""
+    return (
+        f"{model_id:<{widths['model']}}  "
+        f"{meta.get('speed', ''):<{widths['speed']}}  "
+        f"{meta.get('strengths', ''):<{widths['strengths']}}  "
+        f"{meta.get('price', '')}"
+    )
+
+
+def _configure_imagegen_model(backend_name: str, config: dict) -> None:
+    """Prompt the user to pick a model for the given imagegen backend.
+
+    Writes selection to ``config[backend_config_key]["model"]``. Safe to
+    call even when stdin is not a TTY — curses_radiolist falls back to
+    keeping the current selection.
+    """
+    backend = IMAGEGEN_BACKENDS.get(backend_name)
+    if not backend:
+        return
+
+    catalog, default_model = backend["catalog_fn"]()
+    if not catalog:
+        return
+
+    cfg_key = backend["config_key"]
+    cur_cfg = config.setdefault(cfg_key, {})
+    if not isinstance(cur_cfg, dict):
+        cur_cfg = {}
+        config[cfg_key] = cur_cfg
+    current_model = cur_cfg.get("model") or default_model
+    if current_model not in catalog:
+        current_model = default_model
+
+    model_ids = list(catalog.keys())
+    # Put current model at the top so the cursor lands on it by default.
+    ordered = [current_model] + [m for m in model_ids if m != current_model]
+
+    # Column widths
+    widths = {
+        "model": max(len(m) for m in model_ids),
+        "speed": max((len(catalog[m].get("speed", "")) for m in model_ids), default=6),
+        "strengths": max((len(catalog[m].get("strengths", "")) for m in model_ids), default=0),
+    }
+
+    print()
+    header = (
+        f"  {'Model':<{widths['model']}}  "
+        f"{'Speed':<{widths['speed']}}  "
+        f"{'Strengths':<{widths['strengths']}}  "
+        f"Price"
+    )
+    print(color(header, Colors.CYAN))
+
+    rows = []
+    for mid in ordered:
+        row = _format_imagegen_model_row(mid, catalog[mid], widths)
+        if mid == current_model:
+            row += "  ← currently in use"
+        rows.append(row)
+
+    idx = _prompt_choice(
+        f"  Choose {backend['display']} model:",
+        rows,
+        default=0,
+    )
+
+    chosen = ordered[idx]
+    cur_cfg["model"] = chosen
+    _print_success(f"  Model set to: {chosen}")
+
+
 def _configure_provider(provider: dict, config: dict):
     """Configure a single provider - prompt for API keys and set config."""
     env_vars = provider.get("env_vars", [])
@@ -946,22 +1108,42 @@ def _configure_provider(provider: dict, config: dict):
 
     # Set TTS provider in config if applicable
     if provider.get("tts_provider"):
-        config.setdefault("tts", {})["provider"] = provider["tts_provider"]
+        tts_cfg = config.setdefault("tts", {})
+        tts_cfg["provider"] = provider["tts_provider"]
+        tts_cfg["use_gateway"] = bool(managed_feature)
 
     # Set browser cloud provider in config if applicable
     if "browser_provider" in provider:
         bp = provider["browser_provider"]
+        browser_cfg = config.setdefault("browser", {})
         if bp == "local":
-            config.setdefault("browser", {})["cloud_provider"] = "local"
+            browser_cfg["cloud_provider"] = "local"
             _print_success("  Browser set to local mode")
         elif bp:
-            config.setdefault("browser", {})["cloud_provider"] = bp
+            browser_cfg["cloud_provider"] = bp
             _print_success(f"  Browser cloud provider set to: {bp}")
+        browser_cfg["use_gateway"] = bool(managed_feature)
 
     # Set web search backend in config if applicable
     if provider.get("web_backend"):
-        config.setdefault("web", {})["backend"] = provider["web_backend"]
+        web_cfg = config.setdefault("web", {})
+        web_cfg["backend"] = provider["web_backend"]
+        web_cfg["use_gateway"] = bool(managed_feature)
         _print_success(f"  Web backend set to: {provider['web_backend']}")
+
+    # For tools without a specific config key (e.g. image_gen), still
+    # track use_gateway so the runtime knows the user's intent.
+    if managed_feature and managed_feature not in ("web", "tts", "browser"):
+        config.setdefault(managed_feature, {})["use_gateway"] = True
+    elif not managed_feature:
+        # User picked a non-gateway provider — find which category this
+        # belongs to and clear use_gateway if it was previously set.
+        for cat_key, cat in TOOL_CATEGORIES.items():
+            if provider in cat.get("providers", []):
+                section = config.get(cat_key)
+                if isinstance(section, dict) and section.get("use_gateway"):
+                    section["use_gateway"] = False
+                break
 
     if not env_vars:
         if provider.get("post_setup"):
@@ -969,11 +1151,10 @@ def _configure_provider(provider: dict, config: dict):
         _print_success(f"  {provider['name']} - no configuration needed!")
         if managed_feature:
             _print_info("  Requests for this tool will be billed to your Nous subscription.")
-            override_envs = provider.get("override_env_vars", [])
-            if any(get_env_value(env_var) for env_var in override_envs):
-                _print_warning(
-                    "  Direct credentials are still configured and may take precedence until you remove them from ~/.hermes/.env."
-                )
+        # Imagegen backends prompt for model selection after backend pick.
+        backend = provider.get("imagegen_backend")
+        if backend:
+            _configure_imagegen_model(backend, config)
         return
 
     # Prompt for each required env var
@@ -1008,6 +1189,10 @@ def _configure_provider(provider: dict, config: dict):
 
     if all_configured:
         _print_success(f"  {provider['name']} configured!")
+        # Imagegen backends prompt for model selection after env vars are in.
+        backend = provider.get("imagegen_backend")
+        if backend:
+            _configure_imagegen_model(backend, config)
 
 
 def _configure_simple_requirements(ts_key: str):
@@ -1033,17 +1218,17 @@ def _configure_simple_requirements(ts_key: str):
                 _print_warning("    Skipped")
         elif idx == 1:
             base_url = _prompt("    OPENAI_BASE_URL (blank for OpenAI)").strip() or "https://api.openai.com/v1"
-            key_label = "    OPENAI_API_KEY" if "api.openai.com" in base_url.lower() else "    API key"
+            is_native_openai = base_url_hostname(base_url) == "api.openai.com"
+            key_label = "    OPENAI_API_KEY" if is_native_openai else "    API key"
             api_key = _prompt(key_label, password=True)
             if api_key and api_key.strip():
                 save_env_value("OPENAI_API_KEY", api_key.strip())
                 # Save vision base URL to config (not .env — only secrets go there)
-                from hermes_cli.config import load_config, save_config
                 _cfg = load_config()
                 _aux = _cfg.setdefault("auxiliary", {}).setdefault("vision", {})
                 _aux["base_url"] = base_url
                 save_config(_cfg)
-                if "api.openai.com" in base_url.lower():
+                if is_native_openai:
                     save_env_value("AUXILIARY_VISION_MODEL", "gpt-4o-mini")
                 _print_success("    Saved")
             else:
@@ -1179,11 +1364,10 @@ def _reconfigure_provider(provider: dict, config: dict):
         _print_success(f"  {provider['name']} - no configuration needed!")
         if managed_feature:
             _print_info("  Requests for this tool will be billed to your Nous subscription.")
-            override_envs = provider.get("override_env_vars", [])
-            if any(get_env_value(env_var) for env_var in override_envs):
-                _print_warning(
-                    "  Direct credentials are still configured and may take precedence until you remove them from ~/.hermes/.env."
-                )
+        # Imagegen backends prompt for model selection on reconfig too.
+        backend = provider.get("imagegen_backend")
+        if backend:
+            _configure_imagegen_model(backend, config)
         return
 
     for var in env_vars:
@@ -1200,6 +1384,11 @@ def _reconfigure_provider(provider: dict, config: dict):
             _print_success("    Updated")
         else:
             _print_info("    Kept current")
+
+    # Imagegen backends prompt for model selection on reconfig too.
+    backend = provider.get("imagegen_backend")
+    if backend:
+        _configure_imagegen_model(backend, config)
 
 
 def _reconfigure_simple_requirements(ts_key: str):
