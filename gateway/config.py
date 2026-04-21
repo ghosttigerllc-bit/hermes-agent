@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    TELEGRAM_MTPROTO = "telegram_mtproto"
 
 
 @dataclass
@@ -798,6 +799,29 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             name=os.getenv("TELEGRAM_HOME_CHANNEL_NAME", "Home"),
         )
     
+    # Telegram MTProto (user account, not bot)
+    mtproto_phone = os.getenv("TELEGRAM_MTPROTO_PHONE")
+    if mtproto_phone:
+        if Platform.TELEGRAM_MTPROTO not in config.platforms:
+            config.platforms[Platform.TELEGRAM_MTPROTO] = PlatformConfig()
+        config.platforms[Platform.TELEGRAM_MTPROTO].enabled = True
+        config.platforms[Platform.TELEGRAM_MTPROTO].extra.update({
+            "phone": mtproto_phone,
+            "api_id": os.getenv("TELEGRAM_MTPROTO_API_ID", ""),
+            "api_hash": os.getenv("TELEGRAM_MTPROTO_API_HASH", ""),
+            "session_path": os.getenv("TELEGRAM_MTPROTO_SESSION_PATH", "./data/telegram-mtproto/session"),
+            "group_policy": os.getenv("TELEGRAM_MTPROTO_GROUP_POLICY", "both"),
+            "admin_chat_id": os.getenv("TELEGRAM_MTPROTO_ADMIN_CHAT_ID", ""),
+        })
+
+    mtproto_home = os.getenv("TELEGRAM_MTPROTO_HOME_CHANNEL")
+    if mtproto_home and Platform.TELEGRAM_MTPROTO in config.platforms:
+        config.platforms[Platform.TELEGRAM_MTPROTO].home_channel = HomeChannel(
+            platform=Platform.TELEGRAM_MTPROTO,
+            chat_id=mtproto_home,
+            name=os.getenv("TELEGRAM_MTPROTO_HOME_CHANNEL_NAME", "Home"),
+        )
+
     # Discord
     discord_token = os.getenv("DISCORD_BOT_TOKEN")
     if discord_token:

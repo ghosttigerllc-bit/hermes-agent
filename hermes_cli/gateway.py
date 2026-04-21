@@ -2002,6 +2002,32 @@ _PLATFORMS = [
              "help": "OpenID to deliver cron results and notifications to."},
         ],
     },
+    {
+        "key": "telegram_mtproto",
+        "label": "Telegram (MTProto User Account)",
+        "emoji": "📡",
+        "token_var": "TELEGRAM_MTPROTO_PHONE",
+        "setup_instructions": [
+            "1. Go to https://my.telegram.org and log in with your phone number",
+            "2. Go to 'API development tools' and create an application",
+            "3. Note your api_id (number) and api_hash (string)",
+            "4. This uses a USER ACCOUNT, not a bot — the agent operates as a real Telegram user",
+            "5. First run will send a verification code to your Telegram app",
+        ],
+        "vars": [
+            {"name": "TELEGRAM_MTPROTO_PHONE", "prompt": "Phone number (E.164 format, e.g. +1234567890)", "password": False,
+             "help": "The phone number of the Telegram user account."},
+            {"name": "TELEGRAM_MTPROTO_API_ID", "prompt": "API ID (number from my.telegram.org)", "password": False,
+             "help": "Numeric API ID from step 2 above."},
+            {"name": "TELEGRAM_MTPROTO_API_HASH", "prompt": "API Hash (string from my.telegram.org)", "password": True,
+             "help": "API Hash string from step 2 above."},
+            {"name": "TELEGRAM_MTPROTO_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated, leave empty for open access)", "password": False,
+             "is_allowlist": True,
+             "help": "Optional — restrict DM access to specific Telegram user IDs."},
+            {"name": "TELEGRAM_MTPROTO_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty)", "password": False,
+             "help": "Chat ID for delivering cron results and notifications."},
+        ],
+    },
 ]
 
 

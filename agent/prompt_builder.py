@@ -384,6 +384,14 @@ PLATFORM_HINTS = {
         "your response. Images are sent as native photos, and other files arrive as downloadable "
         "documents."
     ),
+    "telegram_mtproto": (
+        "You are on Telegram via a user account (MTProto, not Bot API). "
+        "Standard markdown is supported. You have full user capabilities: "
+        "you can DM anyone first, send larger files, and have no privacy mode "
+        "restrictions in groups. You can send media files natively: include "
+        "MEDIA:/absolute/path/to/file in your response. Images, voice notes, "
+        "videos, and documents are all supported."
+    ),
 }
 
 # ---------------------------------------------------------------------------

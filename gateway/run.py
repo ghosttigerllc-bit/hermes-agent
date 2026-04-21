@@ -2427,7 +2427,14 @@ class GatewayRunner:
                 logger.warning("Telegram: python-telegram-bot not installed")
                 return None
             return TelegramAdapter(config)
-        
+
+        elif platform == Platform.TELEGRAM_MTPROTO:
+            from gateway.platforms.telegram_mtproto import TelegramMTProtoAdapter, check_telegram_mtproto_requirements
+            if not check_telegram_mtproto_requirements():
+                logger.warning("Telegram MTProto: telethon not installed")
+                return None
+            return TelegramMTProtoAdapter(config)
+
         elif platform == Platform.DISCORD:
             from gateway.platforms.discord import DiscordAdapter, check_discord_requirements
             if not check_discord_requirements():
@@ -2601,6 +2608,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.TELEGRAM_MTPROTO: "TELEGRAM_MTPROTO_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -2619,6 +2627,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.TELEGRAM_MTPROTO: "TELEGRAM_MTPROTO_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)

@@ -286,6 +286,12 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
+
+    "hermes-telegram-mtproto": {
+        "description": "Telegram MTProto (user account) toolset - full user capabilities, DM initiation, no privacy mode",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
@@ -392,7 +398,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-telegram-mtproto", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
     }
 }
 

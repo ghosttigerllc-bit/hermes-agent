@@ -163,6 +163,7 @@ def _handle_send(args):
         "weixin": Platform.WEIXIN,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "telegram_mtproto": Platform.TELEGRAM_MTPROTO,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -472,6 +473,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
         elif platform == Platform.QQBOT:
             result = await _send_qqbot(pconfig, chat_id, chunk)
+        elif platform == Platform.TELEGRAM_MTPROTO:
+            result = {"error": "telegram_mtproto: standalone sending not supported — requires active Telethon session. Use the gateway adapter instead."}
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
